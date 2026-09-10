@@ -1,0 +1,9 @@
+# Secrets — NEVER commit
+.env
+dagobert.env
+
+# Backup files
+backup/
+
+# OS
+.DS_Store
