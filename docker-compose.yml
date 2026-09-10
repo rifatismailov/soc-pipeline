@@ -12,8 +12,12 @@ services:
       - DB_TYPE=sqlite
       - DB_SQLITE_DATABASE=/home/node/.n8n/database.sqlite
       - N8N_USER_FOLDER=/home/node/.n8n
+      - N8N_PROTOCOL=https
+      - N8N_SSL_CERT=/home/node/.n8n/certs/server.crt
+      - N8N_SSL_KEY=/home/node/.n8n/certs/server.key
     volumes:
       - n8n_data:/home/node/.n8n
+      - ./certs:/home/node/.n8n/certs:ro
     networks:
       - soc-net
     deploy:
@@ -22,13 +26,13 @@ services:
           cpus: "1.0"
           memory: 1G
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:5678/healthz || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- --no-check-certificate https://localhost:5678/healthz || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 30s
 
-# Dagobert буде додано пізніше як другий сервіс
+# Dagobert буде додано пізніше
 
 volumes:
   n8n_data:
