@@ -2,7 +2,7 @@ services:
 
   # ── Dagobert (Case Management) ─────────────────────────────────────
   dagobert:
-    image: ghcr.io/sprungknoedl/dagobert:latest
+    image: sprungknoedl/dagobert:latest
     container_name: dagobert
     restart: unless-stopped
     # Порт НЕ пробрасується на хост — доступ тільки через nginx-dagobert
