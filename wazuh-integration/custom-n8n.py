@@ -24,6 +24,9 @@ CUSTOM_RULE_MIN_ID = 100500
 # Таймаут запиту до n8n (сек)
 REQUEST_TIMEOUT = 10
 
+# Rule ID які пропускаємо — залишити порожнім, фільтрація по контенту робиться в n8n
+SKIP_RULE_IDS = set()
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 LOG_FILE = "/var/ossec/logs/integrations/custom-n8n.log"
@@ -66,6 +69,10 @@ def main():
 
     if level < MIN_LEVEL:
         log(f"SKIP rule_id={rule_id} level={level} (< {MIN_LEVEL})")
+        sys.exit(0)
+
+    if rule_id in SKIP_RULE_IDS:
+        log(f"SKIP rule_id={rule_id} (FP exclusion list)")
         sys.exit(0)
 
     # Формуємо payload для n8n

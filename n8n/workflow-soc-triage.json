@@ -1,0 +1,158 @@
+{
+  "name": "SOC Triage — Wazuh → Claude → Dagobert",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "wazuh-alerts",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "node-01-webhook",
+      "name": "Wazuh Alert",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        160,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ================================================================\n// NODE 1: DEDUP\n// Verified fields: alerts_20260910_1657.json (659 events)\n// ВАЖЛИВО: Always Output Data = OFF\n// ================================================================\n\nconst TTL_MS = 5 * 60 * 1000;\n\nconst raw   = $input.first().json;\nconst alert = raw.body ?? raw;\n\nconst rule      = alert.rule  || {};\nconst agent     = alert.agent || {};\nconst eventdata = alert.data?.win?.eventdata || {};\n\nconst ruleId  = String(rule.id   || '');\nconst agentId = String(agent.id  || agent.name || '');\n\nfunction norm(v) {\n  return String(v || '').toLowerCase().replace(/\\\\/g, '\\\\').trim();\n}\n\nfunction buildKey() {\n  const base = `${agentId}::${ruleId}`;\n\n  // Authentication events — реальні поля: ipAddress, targetUserName, subjectUserName\n  if (ruleId === '100820' || ruleId === '100870') {\n    return [base, norm(eventdata.ipAddress), norm(eventdata.targetUserName), norm(eventdata.subjectUserName)].join('::');\n  }\n\n  // SeDebugPrivilege — реальне поле: subjectUserName тільки\n  if (ruleId === '100830') {\n    return `${base}::${norm(eventdata.subjectUserName)}`;\n  }\n\n  // LSASS access — реальні поля: sourceImage, targetImage, grantedAccess\n  if (ruleId === '100740') {\n    return [base, norm(eventdata.sourceImage), norm(eventdata.grantedAccess)].join('::');\n  }\n\n  // CreateRemoteThread — реальні поля: sourceImage, targetImage\n  if (ruleId === '100880' || ruleId === '100881') {\n    return [base, norm(eventdata.sourceImage), norm(eventdata.targetImage)].join('::');\n  }\n\n  // DLL events — imageLoaded ВІДСУТНІЙ у реальних alerts, тільки image\n  if (['100882', '100883', '100884', '100825', '100826'].includes(ruleId)) {\n    return `${base}::${norm(eventdata.image)}`;\n  }\n\n  // 100743 Persistence — eventdata порожній, кожна подія унікальна\n  if (ruleId === '100743') {\n    return `${base}::${alert.alert_id || alert.id || Date.now()}`;\n  }\n\n  // Process events (100713, 100716, 100723, 100810 та решта)\n  // Реальні поля: image, commandLine. НЕ обрізаємо cmd — enc payload різниця в кінці\n  return `${base}::${norm(eventdata.image)}::${norm(eventdata.commandLine)}`;\n}\n\nconst key   = buildKey();\nconst store = $getWorkflowStaticData('global');\nconst seen  = store.dedup || {};\nconst now   = Date.now();\n\nfor (const k of Object.keys(seen)) {\n  if (now - seen[k] > TTL_MS) delete seen[k];\n}\n\nif (seen[key]) {\n  store.dedup = seen;\n  return [];\n}\n\nseen[key] = now;\nstore.dedup = seen;\n\nalert.soc = {\n  dedup_key:    key,\n  dedup_ttl_s:  300,\n  dedup_status: 'NEW'\n};\n\nreturn [{ json: alert }];"
+      },
+      "id": "node-02-dedup",
+      "name": "DEDUP",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        360,
+        300
+      ],
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// ================================================================\n// NODE 2: FP CLASSIFIER\n// Verified fields: alerts_20260910_1657.json (659 events)\n// ВАЖЛИВО: Always Output Data = OFF\n//\n// ВИПРАВЛЕНО vs ChatGPT:\n//   - imageLoaded відсутній у реальних alerts → весь imgL-код прибрано\n//   - parentImage відсутній у реальних alerts → прибрано\n//   - grantedAccess: '0x1010' → '0x101000' (реальне значення!)\n//   - Додано NEVER_DROP: ці rules ніколи не silent drop\n//   - FP → зупинка + FP journal; FP_CANDIDATE/PASS → до Claude\n// ================================================================\n\nconst alert     = $input.first().json;\nconst rule      = alert.rule  || {};\nconst eventdata = alert.data?.win?.eventdata || {};\n\nconst ruleId = String(rule.id    || '');\nconst level  = Number(rule.level || 0);\n\nfunction norm(v) {\n  return String(v || '').toLowerCase().replace(/\\//g, '\\\\').trim();\n}\n\nconst img       = norm(eventdata.image);\nconst cmd       = norm(eventdata.commandLine);\nconst srcImg    = norm(eventdata.sourceImage);\nconst tgtImg    = norm(eventdata.targetImage);\nconst subjUser  = norm(eventdata.subjectUserName);\nconst tgtUser   = norm(eventdata.targetUserName);\nconst tgtDomain = norm(eventdata.targetDomainName || '');\nconst access    = norm(eventdata.grantedAccess);\n\n// Ніколи не silent drop — навіть якщо isFP() = true → FP_CANDIDATE\nconst NEVER_DROP = new Set([\n  '100740','100741','100744','100742',\n  '100730','100780','100782','100783','100786','100787',\n  '100750','100824','100798','100799',\n  '100795','100796','100880',\n  '100841','100842','100843','100743',\n  '100731',\n]);\n\nfunction classify() {\n\n  // ── 100883: Unsigned DLL ──────────────────────────────────────────\n  // imageLoaded ВІДСУТНІЙ у реальних alerts — перевіряємо тільки image\n  if (ruleId === '100883') {\n    // Безпечний FP — low-attack-surface системні процеси\n    const fpImages = [\n      'sdiagnhost.exe',               // Windows Diagnostic Host (71 alerts)\n      'wiawow64.exe',                 // Windows Image Acquisition (40 alerts)\n      'hpseu.ui.wpf.exe',             // HP System Event Utility\n      'mfscanutility.exe',            // Scanner utility\n      'nvbackend.exe',                // NVIDIA Backend\n      'hpsystemeventutilityhost.exe', // HP\n      'cmfnss6.exe',                  // Canon scanner\n    ];\n    if (fpImages.some(n => img.endsWith('\\\\' + n) || img.endsWith('/' + n))) {\n      return { status: 'FP', reason: `${img.split('\\\\').pop()} — known legitimate app unsigned DLL load` };\n    }\n    // FP_CANDIDATE — можуть бути проексплоітовані, нехай Claude вирішує\n    const candidateImages = [\n      'foxitpdfeditor.exe',  // Foxit — PDF exploit target\n      'mstsc.exe',           // Remote Desktop — exploit/print driver DLL risk\n      'spoolsv.exe',         // Print Spooler — PrintNightmare history\n    ];\n    if (candidateImages.some(n => img.endsWith('\\\\' + n) || img.endsWith('/' + n))) {\n      return { status: 'FP_CANDIDATE', reason: `${img.split('\\\\').pop()} — legitimate app but exploit target, Claude to verify` };\n    }\n    if (img.endsWith('\\\\rundll32.exe')) {\n      return { status: 'FP_CANDIDATE', reason: 'rundll32 loaded unsigned DLL — needs context review' };\n    }\n  }\n\n  // ── 100882: DLL from writable path ───────────────────────────────\n  // imageLoaded ВІДСУТНІЙ — тільки image\n  if (ruleId === '100882') {\n    if (img.endsWith('\\\\dismhost.exe')) {\n      return { status: 'FP', reason: 'DismHost.exe — Windows DISM system component' };\n    }\n  }\n\n  // ── 100713: rundll32 ─────────────────────────────────────────────\n  // Реальні поля: image, commandLine\n  if (ruleId === '100713') {\n    const fpCmds = [\n      'davclnt.dll,davsetcookie',     // WebDAV mapped drives (fs01, 10.10.95.10)\n      'staterepository',              // Windows Store state\n      'capabilityaccessmanager',      // Windows capability\n      'pcasvc.dll,pcapatchsdbtask',   // Program Compatibility Assistant\n      'startupscan.dll,susruntask',   // Windows startup scan\n      'appxdeploymentextensions',     // App deployment\n      'nvcpl.dll,nvstartup',          // NVIDIA startup\n      'nvspcap64.dll,shadowplay',     // NVIDIA ShadowPlay\n      'dfrg.exe',                     // Disk defrag (точно, не просто 'dfrg')\n      'dfrgntfs.exe',                 // Disk defrag NTFS\n      'dfrgfat.exe',                  // Disk defrag FAT\n    ];\n    if (fpCmds.some(p => cmd.includes(p))) {\n      return { status: 'FP', reason: `rundll32 legitimate system/vendor task: ${cmd.slice(0, 80)}` };\n    }\n  }\n\n  // ── 100716: cmd.exe ──────────────────────────────────────────────\n  // Реальні поля: image, commandLine (parentImage ВІДСУТНІЙ!)\n  if (ruleId === '100716') {\n    // Точна перевірка — тільки відомий Adobe native messaging host\n    if (cmd.includes('wcchromenativemessaginghost')) {\n      return { status: 'FP', reason: 'Adobe Acrobat Chrome Extension Native Messaging via cmd.exe' };\n    }\n    // 'acrobat' — занадто широко, може збігтися з payload 'acrobat_helper'\n    // → FP_CANDIDATE замість FP\n    if (cmd.includes('acrobat') && (cmd.includes('/d') || cmd.includes('/s'))) {\n      return { status: 'FP_CANDIDATE', reason: 'cmd.exe with acrobat reference — verify it is genuine Adobe process' };\n    }\n  }\n\n  // ── 100820: Explicit credential logon (Event 4648) ───────────────\n  // Реальні поля: ipAddress, subjectUserName, targetUserName\n  // (processName / parentImage ВІДСУТНІ!)\n  if (ruleId === '100820') {\n    // Machine account → DWM session (Desktop Window Manager)\n    if (tgtDomain === 'window manager') {\n      return { status: 'FP', reason: 'winlogon.exe DWM session credential — normal Windows session management' };\n    }\n    // Machine account logon to itself\n    if (subjUser && tgtUser && subjUser === tgtUser) {\n      return { status: 'FP', reason: 'Machine account self-logon — normal Windows service behavior' };\n    }\n    // Machine account (ends $) → different user: підозрілий контекст\n    if (subjUser.endsWith('$') && tgtUser && !tgtUser.endsWith('$')) {\n      return { status: 'FP_CANDIDATE', reason: `Machine account ${subjUser} using explicit creds as user ${tgtUser} — verify` };\n    }\n  }\n\n  // ── 100870: Pass-the-Hash ─────────────────────────────────────────\n  // Не можна підтвердити FP без whitelist IP → до Claude\n  if (ruleId === '100870') {\n    return { status: 'PASS', reason: 'PtH candidate — requires Claude context analysis' };\n  }\n\n  // ── 100830: SeDebugPrivilege ──────────────────────────────────────\n  // Реальне поле: subjectUserName тільки, немає process context → до Claude\n  if (ruleId === '100830') {\n    return { status: 'PASS', reason: 'SeDebugPrivilege — no process context, requires Claude analysis' };\n  }\n\n  // ── 100826: Network from suspicious dir ──────────────────────────\n  // Реальне поле: тільки image (destinationIp ВІДСУТНІЙ!)\n  // ВАЖЛИВО: перевіряємо і ім'я, і що бінарник дійсно в AppData/LocalAppData\n  // Це запобігає bypass через перейменування malware у відомий додаток\n  if (ruleId === '100826') {\n    const fpImages = [\n      'vibersandbox.exe',\n      'nahimicnotifsys.exe',\n      'onedrive.exe',\n      'onedrivelauncher.exe',\n      'onedrivestandaloneupdater.exe',\n      'discord.exe',\n      'opera.exe',\n      'filecoauth.exe',\n      'wps.exe',\n      'wpscloudsvr.exe',\n    ];\n    const inAppData = img.includes('\\\\appdata\\\\') || img.includes('\\\\localappdata\\\\');\n    if (inAppData && fpImages.some(n => img.endsWith('\\\\' + n) || img.endsWith('/' + n))) {\n      return { status: 'FP', reason: `${img.split('\\\\').pop()} — known legitimate app from AppData` };\n    }\n    // Відоме ім'я але НЕ в AppData — підозріло\n    if (!inAppData && fpImages.some(n => img.endsWith('\\\\' + n) || img.endsWith('/' + n))) {\n      return { status: 'FP_CANDIDATE', reason: `${img.split('\\\\').pop()} — known app name but unexpected path: ${img}` };\n    }\n  }\n\n  // ── 100825: C2 LOLBin network ─────────────────────────────────────\n  // Немає destinationIp → до Claude\n  if (ruleId === '100825') {\n    return { status: 'PASS', reason: 'LOLBin network connection — no destination IP in event, needs Claude' };\n  }\n\n  // ── 100740: LSASS access ──────────────────────────────────────────\n  // Реальні поля: sourceImage, targetImage, grantedAccess\n  // ВИПРАВЛЕНО: реальне значення = '0x101000' (НЕ '0x1010' як у ChatGPT!)\n  if (ruleId === '100740') {\n    if (srcImg.endsWith('\\\\svchost.exe') && access === '0x101000') {\n      return { status: 'FP', reason: 'svchost PROCESS_QUERY_LIMITED_INFORMATION on LSASS — normal Windows behavior' };\n    }\n    // Все інше — NEVER DROP, до Claude\n    return { status: 'PASS', reason: 'LSASS access — requires manual review' };\n  }\n\n  // ── 100881: CreateRemoteThread ────────────────────────────────────\n  // Реальні поля: sourceImage, targetImage\n  // (startModule / startFunction ВІДСУТНІ!)\n  if (ruleId === '100881') {\n    if (tgtImg.includes('mpcmdrun.exe')) {\n      return { status: 'FP_CANDIDATE', reason: 'Unknown process → MpCmdRun.exe — possibly AV scan or injection' };\n    }\n  }\n\n  return { status: 'PASS', reason: '' };\n}\n\n// ── Виконання ─────────────────────────────────────────────────────\nconst result = classify();\n\n// NEVER DROP override: навіть якщо FP → FP_CANDIDATE (не silent drop)\nif (NEVER_DROP.has(ruleId) && result.status === 'FP') {\n  result.status = 'FP_CANDIDATE';\n  result.reason = '[NEVER_DROP override] ' + result.reason;\n}\n\nalert.soc = {\n  ...(alert.soc || {}),\n  fp_status:          result.status,\n  fp_reason:          result.reason,\n  requires_ai_review: result.status !== 'FP',\n};\n\nif (result.status === 'FP') {\n  try {\n    const fs   = require('fs');\n    const path = require('path');\n    const dir  = '/home/node/.n8n/fp-journal';\n    fs.mkdirSync(dir, { recursive: true });\n    const entry = {\n      ts:        new Date().toISOString(),\n      source:    'n8n_node2',\n      rule_id:   ruleId,\n      level,\n      agent:     alert.agent?.name || '',\n      img,\n      cmd,\n      fp_reason: result.reason,\n    };\n    fs.appendFileSync(path.join(dir, 'fp_journal.jsonl'), JSON.stringify(entry) + '\\n');\n  } catch(e) {}\n\n  return []; // Confirmed FP — stop\n}\n\n// FP_CANDIDATE або PASS → до Claude\nreturn [{ json: alert }];\n"
+      },
+      "id": "node-03-fp",
+      "name": "FP Classifier",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        300
+      ],
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json;\nconst alert = raw.body ?? raw;\n\nconst agent = alert.agent || {};\nconst rule  = alert.rule  || {};\nconst data  = alert.data  || {};\nconst soc   = alert.soc   || {};\n\nconst corrKey = `${agent.ip || agent.id}::${rule.id}`;\n\nreturn [{\n  json: {\n    alert,\n    agent,\n    rule,\n    data,\n    soc,\n    corrKey,\n    alertId:    alert.id || alert.alert_id || '',\n    timestamp:  alert.timestamp || new Date().toISOString(),\n    ruleId:     String(rule.id    || ''),\n    ruleLevel:  Number(rule.level || 0),\n    agentName:  agent.name || 'unknown',\n    agentIp:    agent.ip   || '',\n    fpStatus:   soc.fp_status   || 'PASS',\n    fpReason:   soc.fp_reason   || '',\n  }\n}];"
+      },
+      "id": "node-04-normalize",
+      "name": "Normalize Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst rule  = d.rule;\nconst agent = d.agent;\nconst data  = d.data;\n\nconst fpNote = d.fpStatus === 'FP_CANDIDATE'\n  ? `\\n\\n⚠️ NOTE: Pre-classifier flagged this as FP_CANDIDATE: ${d.fpReason}. Confirm or override.`\n  : '';\n\nconst SYSTEM = `You are an expert SOC analyst. Analyze the Wazuh SIEM alert below and classify it.\n\nReturn ONLY a valid JSON object. No markdown fences, no prose, nothing else.\n\nJSON schema:\n{\n  \"verdict\":            \"fp\" | \"benign\" | \"suspicious\" | \"malicious\" | \"unknown\",\n  \"confidence\":         <float 0.0-1.0>,\n  \"severity\":           \"low\" | \"medium\" | \"high\" | \"critical\",\n  \"summary\":            \"<one sentence, what happened>\",\n  \"mitre_techniques\":   [\"T<id>\", ...],\n  \"create_case\":        <true|false>,\n  \"fp_reason\":          \"<why FP — only if verdict=fp, else empty string>\",\n  \"suppressor_hint\":    \"<Wazuh rule XML field to suppress — only if verdict=fp, else empty string>\",\n  \"recommended_action\": \"<what the analyst should do next>\"\n}\n\nClassification rules:\n- fp         → confirmed false positive: known-good software, legitimate admin action, Windows Defender scan artifact, standard service startup\n- benign     → legitimate activity, no action needed\n- suspicious → warrants investigation, could be an attack stage\n- malicious  → high-confidence attack or active compromise\n- unknown    → insufficient context\n\ncreate_case = true  for: suspicious, malicious, unknown\ncreate_case = false for: fp, benign\n\nWhen verdict=fp, suppressor_hint must contain the Wazuh rule XML <field> condition to suppress this specific FP.`;\n\nconst USER = `Wazuh Alert:\n\nRule ID    : ${d.ruleId}\nRule Level : ${d.ruleLevel}/15\nDescription: ${rule.description || ''}\nGroups     : ${JSON.stringify(rule.groups || [])}\nMITRE      : ${JSON.stringify(rule.mitre || {})}\nAgent      : ${d.agentName} (${d.agentIp})\nTimestamp  : ${d.timestamp}\nCorr-Key   : ${d.corrKey}${fpNote}\n\nAlert data (JSON):\n${JSON.stringify(data, null, 2)}`;\n\nreturn [{\n  json: {\n    alertCtx: d,\n    claudeReq: {\n      model:      'claude-haiku-4-5-20251001',\n      max_tokens: 1024,\n      system:     SYSTEM,\n      messages:   [{ role: 'user', content: USER }]\n    }\n  }\n}];"
+      },
+      "id": "node-05-build-prompt",
+      "name": "Build Claude Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.claudeReq) }}"
+      },
+      "id": "node-99-respond",
+      "name": "Respond 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1160,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Wazuh Alert": {
+      "main": [
+        [
+          {
+            "node": "DEDUP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DEDUP": {
+      "main": [
+        [
+          {
+            "node": "FP Classifier",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "FP Classifier": {
+      "main": [
+        [
+          {
+            "node": "Normalize Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Alert": {
+      "main": [
+        [
+          {
+            "node": "Build Claude Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Claude Prompt": {
+      "main": [
+        [
+          {
+            "node": "Respond 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": [
+    {
+      "name": "SOC"
+    }
+  ]
+}
