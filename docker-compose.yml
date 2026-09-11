@@ -16,11 +16,11 @@ services:
     networks:
       - soc-net
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/ > /dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   # ── nginx: TLS-термінатор для Dagobert ────────────────────────────
   nginx-dagobert:
@@ -36,7 +36,7 @@ services:
       - soc-net
     depends_on:
       dagobert:
-        condition: service_healthy
+        condition: service_started
 
   # ── n8n ────────────────────────────────────────────────────────────
   n8n:
