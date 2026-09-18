@@ -1,5 +1,4 @@
 {
-  "name": "SOC Triage — Wazuh → Claude → Dagobert",
   "nodes": [
     {
       "parameters": {
@@ -8,82 +7,616 @@
         "responseMode": "responseNode",
         "options": {}
       },
-      "id": "node-01-webhook",
+      "id": "caecc566-d4b3-4856-9121-eb305b775238",
       "name": "Wazuh Alert",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
       "position": [
-        160,
-        300
-      ]
+        -320,
+        3232
+      ],
+      "webhookId": "32115d41-4b52-4953-bf7a-35191378c4fa"
     },
     {
       "parameters": {
-        "jsCode": "// ================================================================\n// NODE 1: DEDUP\n// Verified fields: alerts_20260910_1657.json (659 events)\n// ВАЖЛИВО: Always Output Data = OFF\n// ================================================================\n\nconst TTL_MS = 5 * 60 * 1000;\n\nconst raw   = $input.first().json;\nconst alert = raw.body ?? raw;\n\nconst rule      = alert.rule  || {};\nconst agent     = alert.agent || {};\nconst eventdata = alert.data?.win?.eventdata || {};\n\nconst ruleId  = String(rule.id   || '');\nconst agentId = String(agent.id  || agent.name || '');\n\nfunction norm(v) {\n  return String(v || '').toLowerCase().replace(/\\\\/g, '\\\\').trim();\n}\n\nfunction buildKey() {\n  const base = `${agentId}::${ruleId}`;\n\n  // Authentication events — реальні поля: ipAddress, targetUserName, subjectUserName\n  if (ruleId === '100820' || ruleId === '100870') {\n    return [base, norm(eventdata.ipAddress), norm(eventdata.targetUserName), norm(eventdata.subjectUserName)].join('::');\n  }\n\n  // SeDebugPrivilege — реальне поле: subjectUserName тільки\n  if (ruleId === '100830') {\n    return `${base}::${norm(eventdata.subjectUserName)}`;\n  }\n\n  // LSASS access — реальні поля: sourceImage, targetImage, grantedAccess\n  if (ruleId === '100740') {\n    return [base, norm(eventdata.sourceImage), norm(eventdata.grantedAccess)].join('::');\n  }\n\n  // CreateRemoteThread — реальні поля: sourceImage, targetImage\n  if (ruleId === '100880' || ruleId === '100881') {\n    return [base, norm(eventdata.sourceImage), norm(eventdata.targetImage)].join('::');\n  }\n\n  // DLL events — imageLoaded ВІДСУТНІЙ у реальних alerts, тільки image\n  if (['100882', '100883', '100884', '100825', '100826'].includes(ruleId)) {\n    return `${base}::${norm(eventdata.image)}`;\n  }\n\n  // 100743 Persistence — eventdata порожній, кожна подія унікальна\n  if (ruleId === '100743') {\n    return `${base}::${alert.alert_id || alert.id || Date.now()}`;\n  }\n\n  // Process events (100713, 100716, 100723, 100810 та решта)\n  // Реальні поля: image, commandLine. НЕ обрізаємо cmd — enc payload різниця в кінці\n  return `${base}::${norm(eventdata.image)}::${norm(eventdata.commandLine)}`;\n}\n\nconst key   = buildKey();\nconst store = $getWorkflowStaticData('global');\nconst seen  = store.dedup || {};\nconst now   = Date.now();\n\nfor (const k of Object.keys(seen)) {\n  if (now - seen[k] > TTL_MS) delete seen[k];\n}\n\nif (seen[key]) {\n  store.dedup = seen;\n  return [];\n}\n\nseen[key] = now;\nstore.dedup = seen;\n\nalert.soc = {\n  dedup_key:    key,\n  dedup_ttl_s:  300,\n  dedup_status: 'NEW'\n};\n\nreturn [{ json: alert }];"
+        "jsCode": "// ================================================================\n// NODE 1: DEDUP\n// n8n Code node — виконується для кожного алерту що приходить з Wazuh\n//\n// Призначення:\n//   Відсіює дублікати алертів протягом TTL вікна (5 хвилин).\n//   Wazuh може згенерувати десятки однакових алертів за секунди\n//   (mimikatz відкриває LSASS в циклі, LOLBin з'єднується кожну хвилину і т.д.).\n//   Без dedup pipeline і Dagobert отримували б спам замість одного інциденту.\n//\n// Як працює:\n//   1. Для кожного алерту будується строковий ключ (buildKey)\n//      що описує \"цю конкретну загрозу від цього агента\"\n//   2. Ключ перевіряється в WorkflowStaticData (глобальний стор n8n)\n//   3. Якщо ключ вже є і не прострочений → алерт кидається (return [])\n//   4. Якщо новий → зберігається, алерт іде далі з полем alert.soc\n//\n// Вхід:  один Wazuh alert JSON (raw.body або raw)\n// Вихід: [] якщо дублікат | [{ json: alert }] якщо новий\n//\n// ВАЖЛИВО в n8n: Always Output Data = OFF\n//   (інакше n8n передає порожній об'єкт замість порожнього масиву)\n//\n// Verified fields: alerts_20260910_1657.json (659 events)\n// ================================================================\n\n// Час життя запису в seen-сторі: 5 хвилин\nconst TTL_MS = 5 * 60 * 1000;\n\n// --- Розпаковка алерту ---\n// Wazuh надсилає алерт напряму як JSON (top-level: timestamp, rule, agent...).\n// n8n Webhook нода зазвичай передає його в $input.first().json без обгортки.\n// Але якщо POST прийшов з Content-Type: application/x-www-form-urlencoded\n// (або через деякі проксі/Logstash), n8n загортає тіло в { body: {...} }.\n// raw.body ?? raw — захисний fallback: якщо body є — беремо його, інакше raw.\nconst raw   = $input.first().json;\nconst alert = raw.body ?? raw;\n\nconst rule      = alert.rule  || {};\nconst agent     = alert.agent || {};\nconst eventdata = alert.data?.win?.eventdata || {};  // Sysmon/Security eventdata (може бути відсутній)\n\nconst ruleId  = String(rule.id   || '');\nconst agentId = String(agent.id  || agent.name || '');  // agent.id — числовий ID, agent.name — fallback\n\n// ----------------------------------------------------------------\n// norm(v) — нормалізація поля для включення в dedup-ключ\n//\n// Проблема: Wazuh/Sysmon повертає шляхи і імена в різному регістрі\n// залежно від версії агента і ОС. Щоб C:\\Windows\\lsass.exe і\n// c:\\windows\\lsass.exe давали один і той самий ключ — приводимо\n// до нижнього регістру. trim() прибирає випадкові пробіли.\n//\n// Backslash не чіпаємо: Sysmon завжди дає \\ (не /), тому\n// нормалізація роздільника не потрібна — ключ буде консистентним.\n// ----------------------------------------------------------------\nfunction norm(v) {\n  return String(v || '').toLowerCase().trim();\n}\n\n// ----------------------------------------------------------------\n// KEY_FIELDS — таблиця: ruleId → функція що повертає масив полів\n//\n// Різні rule ID детектують різні типи атак, тому і поля для ключа\n// різні. Логіка відбору полів: \"мінімальний набір що однозначно\n// ідентифікує один інцидент протягом 5 хвилин\".\n//\n// Щоб додати новий rule — достатньо одного рядка тут.\n// Функцію buildKey() чіпати не треба.\n//\n// Формат ключа після join: \"agentId::ruleId::field1::field2::...\"\n// ----------------------------------------------------------------\nconst KEY_FIELDS = {\n\n  // 100820: Windows Explicit Credential Logon (Event 4648)\n  //   Атакуючий явно вказує credentials для lateral movement.\n  //   Один інцидент = один IP + один target user.\n  //   subjectUserName — хто ініціював (може бути SYSTEM або атакуючий процес).\n  '100820': e => [norm(e.ipAddress), norm(e.targetUserName), norm(e.subjectUserName)],\n\n  // 100870: Pass-the-Hash (Event 4624, LogonType 3, NTLM)\n  //   NTLM мережевий логон — класичний PtH індикатор.\n  //   Унікальність: звідки прийшов логон (IP) + хто залогінився.\n  '100870': e => [norm(e.ipAddress), norm(e.targetUserName), norm(e.subjectUserName)],\n\n  // 100830: SeDebugPrivilege assigned (Event 4672)\n  //   Mimikatz і більшість injectors запитують SeDebugPrivilege перед роботою.\n  //   Унікальність: якому юзеру присвоєно привілей.\n  '100830': e => [norm(e.subjectUserName)],\n\n  // 100740: LSASS memory access (Sysmon Event 10 — ProcessAccess)\n  //   Процес відкриває LSASS з правами читання пам'яті (credential dump).\n  //   Унікальність: який процес (sourceImage) + з якими правами (grantedAccess).\n  //   Без grantedAccess: один і той самий процес міг би відкрити LSASS\n  //   з різними правами — це різні події.\n  '100740': e => [norm(e.sourceImage), norm(e.grantedAccess)],\n\n  // 100880: CreateRemoteThread CRITICAL (Sysmon Event 8, підозрілий source)\n  // 100881: CreateRemoteThread стандартний (Sysmon Event 8)\n  //   Process injection через CreateRemoteThread.\n  //   Унікальність: хто інжектує (sourceImage) → в який процес (targetImage).\n  '100880': e => [norm(e.sourceImage), norm(e.targetImage)],\n  '100881': e => [norm(e.sourceImage), norm(e.targetImage)],\n\n  // 100882: DLL завантажена з user-writable шляху (Sysmon Event 7 — ImageLoad)\n  //   DLL hijacking або malware що дропнув DLL в AppData/Temp/Downloads.\n  //   Унікальність: який процес завантажив підозрілу DLL.\n  '100882': e => [norm(e.image)],\n\n  // 100883: DLL з невалідним або відсутнім підписом (Sysmon Event 7)\n  //   ~895 алертів/день на продакшені — без dedup заспамив би pipeline.\n  //   Унікальність: який процес завантажив непідписану DLL.\n  '100883': e => [norm(e.image)],\n\n  // 100884: LOLBin завантажує підозрілу DLL (Sysmon Event 7)\n  //   Легітимний системний бінарник (rundll32, regsvr32, mshta...)\n  //   використовується для завантаження шкідливого коду.\n  '100884': e => [norm(e.image)],\n\n  // 100825: LOLBin initiated outbound connection (Sysmon Event 3)\n  //   Системний бінарник з'єднується назовні — C2 індикатор.\n  // 100826: Outbound connection з підозрілої директорії (Sysmon Event 3)\n  //   Процес з Temp/AppData/Downloads з'єднується назовні.\n  //   Обидва: unікальність = який процес робить з'єднання.\n  '100825': e => [norm(e.image)],\n  '100826': e => [norm(e.image)],\n\n  // 100743: Persistence mechanism (Run key / Startup folder modified)\n  //   КОЖНА зміна Run key — окремий факт що треба розслідувати.\n  //   Дедуплікація заборонена: використовуємо унікальний alert ID.\n  //   Date.now() — останній fallback якщо Wazuh не передав ID.\n  '100743': _e => [alert.id || alert.alert_id || String(Date.now())],\n};\n\n// ----------------------------------------------------------------\n// buildKey() — будує рядковий dedup-ключ для поточного алерту\n//\n// Структура ключа: \"agentId::ruleId::field1::field2::...\"\n//   agentId — прив'язує ключ до конкретного хоста\n//   ruleId  — тип загрози\n//   fields  — що саме сталось (залежить від типу загрози)\n//\n// Fallback (rule не в KEY_FIELDS):\n//   image + commandLine — підходить для більшості process-based rules\n//   що не потребують спеціальної логіки.\n// ----------------------------------------------------------------\nfunction buildKey() {\n  const base   = `${agentId}::${ruleId}`;\n  const schema = KEY_FIELDS[ruleId];\n\n  if (schema) return [base, ...schema(eventdata)].join('::');\n\n  return [base, norm(eventdata.image), norm(eventdata.commandLine)].join('::');\n}\n\n// ================================================================\n// Dedup logic\n// ================================================================\n\nconst key = buildKey();\n\n// $getWorkflowStaticData('global') — персистентний стор n8n\n// Живе поки запущений workflow. store.dedup = { key: timestamp, ... }\nconst store = $getWorkflowStaticData('global');\nconst seen  = store.dedup || {};\nconst now   = Date.now();\n\n// Очищення прострочених записів (TTL = 5 хвилин)\n// Без цього seen росте необмежено і з часом уповільнює ноду\nfor (const k of Object.keys(seen)) {\n  if (now - seen[k] > TTL_MS) delete seen[k];\n}\n\n// Якщо ключ вже бачили — дублікат, кидаємо алерт\nif (seen[key]) { store.dedup = seen; return []; }\n\n// Новий алерт — зберігаємо ключ і пропускаємо далі\nseen[key] = now;\nstore.dedup = seen;\n\n// Додаємо мета-поле для діагностики і наступних нод pipeline\nalert.soc = {\n  dedup_key:    key,   // для debug і логування\n  dedup_ttl_s:  300,   // скільки секунд цей ключ активний\n  dedup_status: 'NEW', // наступні ноди можуть перевірити статус\n};\n\nreturn [{ json: alert }];\n"
       },
-      "id": "node-02-dedup",
+      "id": "028f9b6a-679f-4457-be6e-95721bb99ce2",
       "name": "DEDUP",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        360,
-        300
+        -112,
+        3232
       ],
       "alwaysOutputData": false
     },
     {
       "parameters": {
-        "jsCode": "// ================================================================\n// NODE 2: FP CLASSIFIER\n// Verified fields: alerts_20260910_1657.json (659 events)\n// ВАЖЛИВО: Always Output Data = OFF\n//\n// ВИПРАВЛЕНО vs ChatGPT:\n//   - imageLoaded відсутній у реальних alerts → весь imgL-код прибрано\n//   - parentImage відсутній у реальних alerts → прибрано\n//   - grantedAccess: '0x1010' → '0x101000' (реальне значення!)\n//   - Додано NEVER_DROP: ці rules ніколи не silent drop\n//   - FP → зупинка + FP journal; FP_CANDIDATE/PASS → до Claude\n// ================================================================\n\nconst alert     = $input.first().json;\nconst rule      = alert.rule  || {};\nconst eventdata = alert.data?.win?.eventdata || {};\n\nconst ruleId = String(rule.id    || '');\nconst level  = Number(rule.level || 0);\n\nfunction norm(v) {\n  return String(v || '').toLowerCase().replace(/\\//g, '\\\\').trim();\n}\n\nconst img       = norm(eventdata.image);\nconst cmd       = norm(eventdata.commandLine);\nconst srcImg    = norm(eventdata.sourceImage);\nconst tgtImg    = norm(eventdata.targetImage);\nconst subjUser  = norm(eventdata.subjectUserName);\nconst tgtUser   = norm(eventdata.targetUserName);\nconst tgtDomain = norm(eventdata.targetDomainName || '');\nconst access    = norm(eventdata.grantedAccess);\n\n// Ніколи не silent drop — навіть якщо isFP() = true → FP_CANDIDATE\nconst NEVER_DROP = new Set([\n  '100740','100741','100744','100742',\n  '100730','100780','100782','100783','100786','100787',\n  '100750','100824','100798','100799',\n  '100795','100796','100880',\n  '100841','100842','100843','100743',\n  '100731',\n]);\n\nfunction classify() {\n\n  // ── 100883: Unsigned DLL ──────────────────────────────────────────\n  // imageLoaded ВІДСУТНІЙ у реальних alerts — перевіряємо тільки image\n  if (ruleId === '100883') {\n    // Безпечний FP — low-attack-surface системні процеси\n    const fpImages = [\n      'sdiagnhost.exe',               // Windows Diagnostic Host (71 alerts)\n      'wiawow64.exe',                 // Windows Image Acquisition (40 alerts)\n      'hpseu.ui.wpf.exe',             // HP System Event Utility\n      'mfscanutility.exe',            // Scanner utility\n      'nvbackend.exe',                // NVIDIA Backend\n      'hpsystemeventutilityhost.exe', // HP\n      'cmfnss6.exe',                  // Canon scanner\n    ];\n    if (fpImages.some(n => img.endsWith('\\\\' + n) || img.endsWith('/' + n))) {\n      return { status: 'FP', reason: `${img.split('\\\\').pop()} — known legitimate app unsigned DLL load` };\n    }\n    // FP_CANDIDATE — можуть бути проексплоітовані, нехай Claude вирішує\n    const candidateImages = [\n      'foxitpdfeditor.exe',  // Foxit — PDF exploit target\n      'mstsc.exe',           // Remote Desktop — exploit/print driver DLL risk\n      'spoolsv.exe',         // Print Spooler — PrintNightmare history\n    ];\n    if (candidateImages.some(n => img.endsWith('\\\\' + n) || img.endsWith('/' + n))) {\n      return { status: 'FP_CANDIDATE', reason: `${img.split('\\\\').pop()} — legitimate app but exploit target, Claude to verify` };\n    }\n    if (img.endsWith('\\\\rundll32.exe')) {\n      return { status: 'FP_CANDIDATE', reason: 'rundll32 loaded unsigned DLL — needs context review' };\n    }\n  }\n\n  // ── 100882: DLL from writable path ───────────────────────────────\n  // imageLoaded ВІДСУТНІЙ — тільки image\n  if (ruleId === '100882') {\n    if (img.endsWith('\\\\dismhost.exe')) {\n      return { status: 'FP', reason: 'DismHost.exe — Windows DISM system component' };\n    }\n  }\n\n  // ── 100713: rundll32 ─────────────────────────────────────────────\n  // Реальні поля: image, commandLine\n  if (ruleId === '100713') {\n    const fpCmds = [\n      'davclnt.dll,davsetcookie',     // WebDAV mapped drives (fs01, 10.10.95.10)\n      'staterepository',              // Windows Store state\n      'capabilityaccessmanager',      // Windows capability\n      'pcasvc.dll,pcapatchsdbtask',   // Program Compatibility Assistant\n      'startupscan.dll,susruntask',   // Windows startup scan\n      'appxdeploymentextensions',     // App deployment\n      'nvcpl.dll,nvstartup',          // NVIDIA startup\n      'nvspcap64.dll,shadowplay',     // NVIDIA ShadowPlay\n      'dfrg.exe',                     // Disk defrag (точно, не просто 'dfrg')\n      'dfrgntfs.exe',                 // Disk defrag NTFS\n      'dfrgfat.exe',                  // Disk defrag FAT\n    ];\n    if (fpCmds.some(p => cmd.includes(p))) {\n      return { status: 'FP', reason: `rundll32 legitimate system/vendor task: ${cmd.slice(0, 80)}` };\n    }\n  }\n\n  // ── 100716: cmd.exe ──────────────────────────────────────────────\n  // Реальні поля: image, commandLine (parentImage ВІДСУТНІЙ!)\n  if (ruleId === '100716') {\n    // Точна перевірка — тільки відомий Adobe native messaging host\n    if (cmd.includes('wcchromenativemessaginghost')) {\n      return { status: 'FP', reason: 'Adobe Acrobat Chrome Extension Native Messaging via cmd.exe' };\n    }\n    // 'acrobat' — занадто широко, може збігтися з payload 'acrobat_helper'\n    // → FP_CANDIDATE замість FP\n    if (cmd.includes('acrobat') && (cmd.includes('/d') || cmd.includes('/s'))) {\n      return { status: 'FP_CANDIDATE', reason: 'cmd.exe with acrobat reference — verify it is genuine Adobe process' };\n    }\n  }\n\n  // ── 100820: Explicit credential logon (Event 4648) ───────────────\n  // Реальні поля: ipAddress, subjectUserName, targetUserName\n  // (processName / parentImage ВІДСУТНІ!)\n  if (ruleId === '100820') {\n    // Machine account → DWM session (Desktop Window Manager)\n    if (tgtDomain === 'window manager') {\n      return { status: 'FP', reason: 'winlogon.exe DWM session credential — normal Windows session management' };\n    }\n    // Machine account logon to itself\n    if (subjUser && tgtUser && subjUser === tgtUser) {\n      return { status: 'FP', reason: 'Machine account self-logon — normal Windows service behavior' };\n    }\n    // Machine account (ends $) → different user: підозрілий контекст\n    if (subjUser.endsWith('$') && tgtUser && !tgtUser.endsWith('$')) {\n      return { status: 'FP_CANDIDATE', reason: `Machine account ${subjUser} using explicit creds as user ${tgtUser} — verify` };\n    }\n  }\n\n  // ── 100870: Pass-the-Hash ─────────────────────────────────────────\n  // Не можна підтвердити FP без whitelist IP → до Claude\n  if (ruleId === '100870') {\n    return { status: 'PASS', reason: 'PtH candidate — requires Claude context analysis' };\n  }\n\n  // ── 100830: SeDebugPrivilege ──────────────────────────────────────\n  // Реальне поле: subjectUserName тільки, немає process context → до Claude\n  if (ruleId === '100830') {\n    return { status: 'PASS', reason: 'SeDebugPrivilege — no process context, requires Claude analysis' };\n  }\n\n  // ── 100826: Network from suspicious dir ──────────────────────────\n  // Реальне поле: тільки image (destinationIp ВІДСУТНІЙ!)\n  // ВАЖЛИВО: перевіряємо і ім'я, і що бінарник дійсно в AppData/LocalAppData\n  // Це запобігає bypass через перейменування malware у відомий додаток\n  if (ruleId === '100826') {\n    const fpImages = [\n      'vibersandbox.exe',\n      'nahimicnotifsys.exe',\n      'onedrive.exe',\n      'onedrivelauncher.exe',\n      'onedrivestandaloneupdater.exe',\n      'discord.exe',\n      'opera.exe',\n      'filecoauth.exe',\n      'wps.exe',\n      'wpscloudsvr.exe',\n    ];\n    const inAppData = img.includes('\\\\appdata\\\\') || img.includes('\\\\localappdata\\\\');\n    if (inAppData && fpImages.some(n => img.endsWith('\\\\' + n) || img.endsWith('/' + n))) {\n      return { status: 'FP', reason: `${img.split('\\\\').pop()} — known legitimate app from AppData` };\n    }\n    // Відоме ім'я але НЕ в AppData — підозріло\n    if (!inAppData && fpImages.some(n => img.endsWith('\\\\' + n) || img.endsWith('/' + n))) {\n      return { status: 'FP_CANDIDATE', reason: `${img.split('\\\\').pop()} — known app name but unexpected path: ${img}` };\n    }\n  }\n\n  // ── 100825: C2 LOLBin network ─────────────────────────────────────\n  // Немає destinationIp → до Claude\n  if (ruleId === '100825') {\n    return { status: 'PASS', reason: 'LOLBin network connection — no destination IP in event, needs Claude' };\n  }\n\n  // ── 100740: LSASS access ──────────────────────────────────────────\n  // Реальні поля: sourceImage, targetImage, grantedAccess\n  // ВИПРАВЛЕНО: реальне значення = '0x101000' (НЕ '0x1010' як у ChatGPT!)\n  if (ruleId === '100740') {\n    if (srcImg.endsWith('\\\\svchost.exe') && access === '0x101000') {\n      return { status: 'FP', reason: 'svchost PROCESS_QUERY_LIMITED_INFORMATION on LSASS — normal Windows behavior' };\n    }\n    // Все інше — NEVER DROP, до Claude\n    return { status: 'PASS', reason: 'LSASS access — requires manual review' };\n  }\n\n  // ── 100881: CreateRemoteThread ────────────────────────────────────\n  // Реальні поля: sourceImage, targetImage\n  // (startModule / startFunction ВІДСУТНІ!)\n  if (ruleId === '100881') {\n    if (tgtImg.includes('mpcmdrun.exe')) {\n      return { status: 'FP_CANDIDATE', reason: 'Unknown process → MpCmdRun.exe — possibly AV scan or injection' };\n    }\n  }\n\n  return { status: 'PASS', reason: '' };\n}\n\n// ── Виконання ─────────────────────────────────────────────────────\nconst result = classify();\n\n// NEVER DROP override: навіть якщо FP → FP_CANDIDATE (не silent drop)\nif (NEVER_DROP.has(ruleId) && result.status === 'FP') {\n  result.status = 'FP_CANDIDATE';\n  result.reason = '[NEVER_DROP override] ' + result.reason;\n}\n\nalert.soc = {\n  ...(alert.soc || {}),\n  fp_status:          result.status,\n  fp_reason:          result.reason,\n  requires_ai_review: result.status !== 'FP',\n};\n\nif (result.status === 'FP') {\n  try {\n    const fs   = require('fs');\n    const path = require('path');\n    const dir  = '/home/node/.n8n/fp-journal';\n    fs.mkdirSync(dir, { recursive: true });\n    const entry = {\n      ts:        new Date().toISOString(),\n      source:    'n8n_node2',\n      rule_id:   ruleId,\n      level,\n      agent:     alert.agent?.name || '',\n      img,\n      cmd,\n      fp_reason: result.reason,\n    };\n    fs.appendFileSync(path.join(dir, 'fp_journal.jsonl'), JSON.stringify(entry) + '\\n');\n  } catch(e) {}\n\n  return []; // Confirmed FP — stop\n}\n\n// FP_CANDIDATE або PASS → до Claude\nreturn [{ json: alert }];\n"
+        "jsCode": "// ================================================================\n// NODE 2: FP CLASSIFIER\n// Вся FP логіка керується через Dagobert UI (/fp-rules/).\n// Ця нода: захист NEVER_DROP + динамічні правила Dagobert + PASS.\n// Жодної жорсткої per-rule логіки тут — нові паттерни додавати через Dagobert.\n// ВАЖЛИВО: Always Output Data = OFF\n// ================================================================\n\nconst alert     = $('DEDUP').first().json;\nconst rule      = alert.rule  || {};\nconst eventdata = alert.data?.win?.eventdata || {};\nconst syscheck  = alert.data?.syscheck || alert.alert?.full_alert?.syscheck || {};\n\nconst ruleId = String(rule.id    || '');\nconst level  = Number(rule.level || 0);\n\nfunction norm(v) { return String(v || '').toLowerCase().replace(/\\//g, '\\\\').trim(); }\n\n// FP правила з Dagobert API (нода Get FP Rules передає дані в цю ноду)\nconst _dynRules = $input.all().map(i => i.json).filter(r => r && r.field);\n\n// Карта полів: назва поля Dagobert → нормалізоване значення події\nconst _fieldMap = {\n  image:             norm(eventdata.image              || ''),\n  commandLine:       norm(eventdata.commandLine        || ''),\n  sourceImage:       norm(eventdata.sourceImage        || ''),\n  targetImage:       norm(eventdata.targetImage        || ''),\n  imageLoaded:       norm(eventdata.imageLoaded        || ''),\n  parentImage:       norm(eventdata.parentImage        || ''),\n  parentCommandLine: norm(eventdata.parentCommandLine  || ''),\n  startModule:       norm(eventdata.startModule        || ''),\n  startFunction:     norm(eventdata.startFunction      || ''),\n  subjectUserName:   norm(eventdata.subjectUserName    || ''),\n  targetUserName:    norm(eventdata.targetUserName     || ''),\n  targetDomainName:  norm(eventdata.targetDomainName   || ''),\n  grantedAccess:     norm(eventdata.grantedAccess      || ''),\n  destinationIp:     norm(eventdata.destinationIp      || ''),\n  destinationPort:   norm(eventdata.destinationPort    || ''),\n  ipAddress:         norm(eventdata.ipAddress          || ''),\n  workstationName:   norm(eventdata.workstationName    || ''),\n  targetServerName:  norm(eventdata.targetServerName   || ''),\n  callTrace:         norm(eventdata.callTrace          || ''),\n  signatureStatus:   norm(eventdata.signatureStatus    || ''),\n  registryPath:      norm(syscheck.path                || ''),\n  filePath:          norm(syscheck.path                || ''),\n  agentName:         norm(alert.agent?.name            || ''),\n  agentIp:           norm(alert.agent?.ip              || ''),\n};\n\n// Правила що НІКОЛИ не можна авто-дропати як FP — примусово FP_CANDIDATE\nconst NEVER_DROP = new Set([\n  '100740','100741','100742','100744',\n  '100730','100731',\n  '100743',\n  '100750',\n  '100780','100782','100783','100786','100787',\n  '100795','100796','100798','100799',\n  '100824',\n  '100841','100842','100843',\n  '100880',\n]);\n\nfunction classify() {\n  for (const r of _dynRules) {\n    if (r.rule_ids && r.rule_ids.length && !r.rule_ids.includes(ruleId)) continue;\n    const val   = _fieldMap[r.field] || '';\n    const check = (r.value || '').toLowerCase();\n    let match = false;\n    if      (r.op === 'includes')   match = val.includes(check);\n    else if (r.op === 'endsWith')   match = val.endsWith(check);\n    else if (r.op === 'startsWith') match = val.startsWith(check);\n    else if (r.op === 'equals')     match = val === check;\n    else if (r.op === 'regex')      match = new RegExp(r.value, 'i').test(val);\n    if (match) return { status: r.status || 'FP', reason: '[dyn] ' + (r.reason || r.field + ' ' + r.op + ' ' + r.value) };\n  }\n  return { status: 'PASS', reason: '' };\n}\n\nconst result = classify();\n\nif (NEVER_DROP.has(ruleId) && result.status === 'FP') {\n  result.status = 'FP_CANDIDATE';\n  result.reason = '[NEVER_DROP] ' + result.reason;\n}\n\nalert.soc = {\n  ...(alert.soc || {}),\n  fp_status:          result.status,\n  fp_reason:          result.reason,\n  requires_ai_review: result.status !== 'FP',\n};\n\nif (result.status === 'FP') {\n  try {\n    const fs = require('fs'), path = require('path');\n    const dir = '/home/node/.n8n/fp-journal';\n    fs.mkdirSync(dir, { recursive: true });\n    fs.appendFileSync(\n      path.join(dir, 'fp_journal.jsonl'),\n      JSON.stringify({ ts: new Date().toISOString(), source: 'n8n_node2', rule_id: ruleId, level, agent: alert.agent?.name || '', fp_reason: result.reason }) + '\\n'\n    );\n\n  } catch(e) {}\n  return [];\n}\nreturn [{ json: alert }];\n"
       },
-      "id": "node-03-fp",
+      "id": "4a16d920-d588-4ad3-87e1-7a7b4ee0feba",
       "name": "FP Classifier",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        560,
-        300
+        352,
+        3232
       ],
       "alwaysOutputData": false
     },
     {
       "parameters": {
-        "jsCode": "const raw = $input.first().json;\nconst alert = raw.body ?? raw;\n\nconst agent = alert.agent || {};\nconst rule  = alert.rule  || {};\nconst data  = alert.data  || {};\nconst soc   = alert.soc   || {};\n\nconst corrKey = `${agent.ip || agent.id}::${rule.id}`;\n\nreturn [{\n  json: {\n    alert,\n    agent,\n    rule,\n    data,\n    soc,\n    corrKey,\n    alertId:    alert.id || alert.alert_id || '',\n    timestamp:  alert.timestamp || new Date().toISOString(),\n    ruleId:     String(rule.id    || ''),\n    ruleLevel:  Number(rule.level || 0),\n    agentName:  agent.name || 'unknown',\n    agentIp:    agent.ip   || '',\n    fpStatus:   soc.fp_status   || 'PASS',\n    fpReason:   soc.fp_reason   || '',\n  }\n}];"
+        "jsCode": "// ================================================================\n// NODE 3: NORMALIZE ALERT\n// ================================================================\n//\n// Призначення:\n//   Розпаковує alert після DEDUP і будує плоску структуру з\n//   усіма ключовими полями на верхньому рівні. Наступні ноди\n//   (Find Existing Case, Build Payloads) читають звідси — не з\n//   вкладеного alert.rule.id, а просто d.ruleId.\n//\n// Вхід:\n//   DEDUP → { timestamp, rule, agent, data, soc, ... }\n//\n// Вихід (плоска структура):\n//   alert      — повний оригінальний об'єкт алерту\n//   agent      — { id, name, ip }\n//   rule       — { id, level, description, groups, mitre }\n//   data       — { win: { eventdata, system }, syscheck, ... }\n//   soc        — { dedup_key, fp_status, fp_reason, ... }\n//   corrKey    — ключ кореляції: agent.ip або agent.id або agent.name\n//                (використовується для пошуку/створення кейсу в Dagobert)\n//   alertId    — унікальний ID алерту від Wazuh\n//   timestamp  — час події\n//   ruleId     — String (щоб порівнювати без Number/String плутанини)\n//   ruleLevel  — Number\n//   agentName  — ім'я хоста\n//   agentIp    — IP агента\n//   fpStatus   — PASS | FP | FP_CANDIDATE\n//   fpReason   — пояснення від FP Classifier\n//\n// ================================================================\n\nconst alert = $input.first().json;\n\nconst agent = alert.agent || {};\nconst rule  = alert.rule  || {};\nconst data  = alert.data  || {};\nconst soc   = alert.soc   || {};\n\nconst corrKey = agent.ip || agent.id || agent.name;\n\nreturn [{ json: {\n  alert,\n  agent,\n  rule,\n  data,\n  soc,\n  corrKey,\n  alertId:   alert.id || alert.alert_id || '',\n  timestamp: alert.timestamp || new Date().toISOString(),\n  ruleId:    String(rule.id    || ''),\n  ruleLevel: Number(rule.level || 0),\n  agentName: agent.name || 'unknown',\n  agentIp:   agent.ip   || '',\n  fpStatus:  soc.fp_status || 'PASS',\n  fpReason:  soc.fp_reason || '',\n} }];\n"
       },
-      "id": "node-04-normalize",
+      "id": "4fd79f2d-155c-40c3-8426-7e09178c6f65",
       "name": "Normalize Alert",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        760,
-        300
+        576,
+        3232
       ]
     },
     {
       "parameters": {
-        "jsCode": "const d = $input.first().json;\nconst rule  = d.rule;\nconst agent = d.agent;\nconst data  = d.data;\n\nconst fpNote = d.fpStatus === 'FP_CANDIDATE'\n  ? `\\n\\n⚠️ NOTE: Pre-classifier flagged this as FP_CANDIDATE: ${d.fpReason}. Confirm or override.`\n  : '';\n\nconst SYSTEM = `You are an expert SOC analyst. Analyze the Wazuh SIEM alert below and classify it.\n\nReturn ONLY a valid JSON object. No markdown fences, no prose, nothing else.\n\nJSON schema:\n{\n  \"verdict\":            \"fp\" | \"benign\" | \"suspicious\" | \"malicious\" | \"unknown\",\n  \"confidence\":         <float 0.0-1.0>,\n  \"severity\":           \"low\" | \"medium\" | \"high\" | \"critical\",\n  \"summary\":            \"<one sentence, what happened>\",\n  \"mitre_techniques\":   [\"T<id>\", ...],\n  \"create_case\":        <true|false>,\n  \"fp_reason\":          \"<why FP — only if verdict=fp, else empty string>\",\n  \"suppressor_hint\":    \"<Wazuh rule XML field to suppress — only if verdict=fp, else empty string>\",\n  \"recommended_action\": \"<what the analyst should do next>\"\n}\n\nClassification rules:\n- fp         → confirmed false positive: known-good software, legitimate admin action, Windows Defender scan artifact, standard service startup\n- benign     → legitimate activity, no action needed\n- suspicious → warrants investigation, could be an attack stage\n- malicious  → high-confidence attack or active compromise\n- unknown    → insufficient context\n\ncreate_case = true  for: suspicious, malicious, unknown\ncreate_case = false for: fp, benign\n\nWhen verdict=fp, suppressor_hint must contain the Wazuh rule XML <field> condition to suppress this specific FP.`;\n\nconst USER = `Wazuh Alert:\n\nRule ID    : ${d.ruleId}\nRule Level : ${d.ruleLevel}/15\nDescription: ${rule.description || ''}\nGroups     : ${JSON.stringify(rule.groups || [])}\nMITRE      : ${JSON.stringify(rule.mitre || {})}\nAgent      : ${d.agentName} (${d.agentIp})\nTimestamp  : ${d.timestamp}\nCorr-Key   : ${d.corrKey}${fpNote}\n\nAlert data (JSON):\n${JSON.stringify(data, null, 2)}`;\n\nreturn [{\n  json: {\n    alertCtx: d,\n    claudeReq: {\n      model:      'claude-haiku-4-5-20251001',\n      max_tokens: 1024,\n      system:     SYSTEM,\n      messages:   [{ role: 'user', content: USER }]\n    }\n  }\n}];"
+        "url": "http://172.18.0.3:8080/cases/",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "responseFormat": "json"
+            }
+          }
+        }
       },
-      "id": "node-05-build-prompt",
-      "name": "Build Claude Prompt",
+      "id": "6d83a47d-c7d6-40e4-858b-1cf30b71598f",
+      "name": "Get Dagobert Cases",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        560,
+        3232
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "5j6IaalQXOwNEFOO",
+          "name": "Dagobert API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ================================================================\n// NODE 4: FIND EXISTING CASE\n// ================================================================\n//\n// Призначення:\n//   Визначає чи існує вже відкритий кейс у Dagobert для цього хоста.\n//   Якщо є — повертає його ID і Name → іде гілка \"Update\".\n//   Якщо немає — повертає порожній existingCaseId → іде гілка \"Create\".\n//\n// Логіка пошуку кейсу:\n//   1. Спочатку перевіряємо WorkflowStaticData (in-memory cache):\n//      caseCache[corrKey] = { id, name, ts }\n//      TTL кешу = 4 години. Якщо запис є і не прострочений — не\n//      звертаємось до Dagobert API зайвий раз.\n//   2. Якщо в кеші немає — шукаємо в списку кейсів від попередньої\n//      HTTP ноди (GET /cases): відкритий кейс з назвою [HOST] що\n//      містить corrKey (IP агента).\n//\n// corrKey:\n//   agent.ip → основний ключ кореляції.\n//   Всі алерти від одного хоста (IP) → один кейс у Dagobert.\n//   Назва кейсу: \"[HOST] <agentName> (<agentIp>)\"\n//\n// Вхід:\n//   Normalize Alert → { corrKey, agentName, agentIp, ruleId, ... }\n//   HTTP GET /cases → масив кейсів { ID, Name, Closed, ... }\n//\n// Вихід:\n//   { ...всі поля з Normalize, existingCaseId, existingCaseName }\n//   existingCaseId = '' → гілка Create New Case\n//   existingCaseId = 'XxXxX' → гілка Update Existing Case\n//\n// ================================================================\n\nconst d       = $('Normalize Alert').first().json;\nconst corrKey = d.corrKey;\n\n// ── Cache lookup ──────────────────────────────────────────────────────────────\nconst store     = $getWorkflowStaticData('global');\nconst caseCache = store.caseCache || {};\nconst now       = Date.now();\n\n// Прибираємо записи старші за 4 години\nfor (const k of Object.keys(caseCache)) {\n  if (now - caseCache[k].ts > 4 * 60 * 60 * 1000) delete caseCache[k];\n}\nstore.caseCache = caseCache;\n\n// Якщо є в кеші — повертаємо одразу\nif (caseCache[corrKey]) {\n  return [{ json: {\n    ...d,\n    existingCaseId:   caseCache[corrKey].id,\n    existingCaseName: caseCache[corrKey].name,\n  } }];\n}\n\n// ── API lookup ────────────────────────────────────────────────────────────────\nconst raw      = $input.first().json;\nconst caseList = Array.isArray(raw.body) ? raw.body : [];\n\nconst existing = caseList.find(c =>\n  !c.Closed &&\n  typeof c.Name === 'string' &&\n  c.Name.startsWith('[HOST]') &&\n  c.Name.includes(corrKey)\n);\n\nreturn [{ json: {\n  ...d,\n  existingCaseId:   existing ? existing.ID   : '',\n  existingCaseName: existing ? existing.Name : '',\n} }];\n"
+      },
+      "id": "7b501280-cd08-4a94-8781-d1d296451b80",
+      "name": "Find Existing Case",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        960,
-        300
+        768,
+        3232
       ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.existingCaseId }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "fd6d63c0-3861-4aab-aaaf-46670b9468d3",
+      "name": "Case Exists?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1008,
+        3232
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ================================================================\n// NODE 5: BUILD UPDATE PAYLOADS\n// ================================================================\n//\n// Призначення:\n//   Гілка \"існуючий кейс\" — будує payload для оновлення кейсу\n//   в Dagobert: додає Event, Indicator, Note і оновлює Summary.\n//\n// Що робить:\n//   1. Event   → /cases/{id}/events/new  (form-urlencoded)\n//      Тип береться з MITRE tactic алерту.\n//      Raw = повний eventdata JSON без скорочень.\n//   2. Note    → /cases/{id}/notes/new   (form-urlencoded)\n//      Повний вміст: rule, agent, MITRE, всі eventdata поля,\n//      повний Windows event message — нічого не обрізається.\n//   3. Indicator → /cases/{id}/indicators/new (form-urlencoded)\n//      Логіка вибору індикатора по rule ID:\n//        100820/100870 → source IP (логон з зовні)\n//        100825/100826 → destination IP:port (outbound C2)\n//        PowerShell rules → commandLine\n//        інші з image → шлях до процесу (Path)\n//        fallback → опис правила\n//   4. Case update → /cases/{id}  (JSON)\n//      Оновлює Name, Severity, Summary з повним контекстом алерту.\n//\n// КРИТИЧНО: sub-endpoints потребують form-urlencoded (баг подвійного decode в Dagobert)\n// POST /cases/{id} (update) використовує JSON — це НЕ sub-entity handler\n//\n// Вхід:  Find Existing Case → { existingCaseId, ruleId, ruleLevel, ... }\n// Вихід: { eventUrl, eventForm, noteUrl, noteForm,\n//           indicatorUrl, indicatorForm, caseUpdateUrl, caseUpdateJson }\n//\n// ================================================================\n\nconst d       = $input.first().json;\nconst caseId  = d.existingCaseId;\nconst ed      = d.data?.win?.eventdata || {};\nconst sys     = d.data?.win?.system    || {};\nconst sc      = d.data?.syscheck || d.alert?.full_alert?.syscheck || {};\n\nconst enc = encodeURIComponent;\n\n// ── Severity ──────────────────────────────────────────────────────────────────\nconst sev = d.ruleLevel >= 12 ? 'High' : d.ruleLevel >= 6 ? 'Medium' : 'Low';\n\n// ── MITRE ─────────────────────────────────────────────────────────────────────\nconst mitre     = d.rule.mitre || {};\nconst mitreIds  = mitre.id        || [];\nconst mitreTech = mitre.technique || [];\nconst mitreTac  = mitre.tactic    || [];\n\n// Відображення Wazuh tactic (title-case) → Dagobert Event Type enum\nconst tacticToType = {\n  'Credential Access':    'Credential Access',\n  'Defense Evasion':      'Defense Evasion',\n  'Discovery':            'Discovery',\n  'Execution':            'Execution',\n  'Exfiltration':         'Exfiltration',\n  'Impact':               'Impact',\n  'Initial Access':       'Initial Access',\n  'Lateral Movement':     'Lateral Movement',\n  'Persistence':          'Persistence',\n  'Privilege Escalation': 'Privilege Escalation',\n  'Reconnaissance':       'Reconnaissance',\n  'Resource Development': 'Resource Development',\n  'Collection':           'Collection',\n  'Command and Control':  'C2',\n};\nconst eventType = mitreTac.map(t => tacticToType[t]).find(Boolean) || 'Other';\n\n// ── MITRE рядок для нотатки ───────────────────────────────────────────────────\nconst mitreStr = mitreIds.length\n  ? mitreIds.map((id, i) => `${id} — ${mitreTech[i] || ''} (${mitreTac.join(', ')})`).join('\\n  ')\n  : 'N/A';\n\n// ── Techniques для форми Event ────────────────────────────────────────────────\nconst techPart = mitreIds.length\n  ? '&' + mitreIds.map(t => `Techniques=${enc(t)}`).join('&')\n  : '';\n\n// ── Всі поля eventdata (без фільтрації, без обрізання) ────────────────────────\nconst edLines = Object.entries(ed)\n  .filter(([, v]) => v !== undefined && v !== null && v !== '')\n  .map(([k, v]) => `  ${k}: ${v}`);\n\n// ── Всі поля syscheck (без фільтрації, без обрізання) ─────────────────────────\nconst scLines = Object.entries(sc)\n  .filter(([, v]) => v !== undefined && v !== null && v !== '')\n  .map(([k, v]) => `  syscheck.${k}: ${v}`);\n\n// ── Повне Windows event message (без обрізання) ───────────────────────────────\nconst sysMsg = sys.message\n  ? `\\n\\n**Event Message (full):**\\n${sys.message}`\n  : '';\n\n// ── Опис нотатки — повний вміст, нічого не обрізається ───────────────────────\nconst noteDesc = [\n  `**Rule:** [${d.ruleId}] ${d.rule.description || d.ruleId}`,\n  `**Level:** ${d.ruleLevel}/15  |  **Severity:** ${sev}`,\n  `**Time:** ${new Date(d.timestamp).toISOString()}`,\n  `**Agent:** ${d.agentName} (${d.agentIp}) — ID: ${d.agent?.id || ''}`,\n  `**FP Status:** ${d.fpStatus}${d.fpReason ? ' — ' + d.fpReason : ''}`,\n  `**Rule Groups:** ${(d.rule.groups || []).join(', ')}`,\n  `\\n**MITRE:**\\n  ${mitreStr}`,\n  sys.eventID\n    ? `\\n**Windows Event:**\\n  EventID: ${sys.eventID}\\n  Channel: ${sys.channel || ''}\\n  Computer: ${sys.computer || ''}\\n  Provider: ${sys.providerName || ''}`\n    : '',\n  (edLines.length || scLines.length)\n    ? `\\n**Event Data:**\\n${[...edLines, ...scLines].join('\\n')}`\n    : '',\n].filter(Boolean).join('\\n') + sysMsg;\n\n// ── Опис події ────────────────────────────────────────────────────────────────\nconst eventDesc = `[${d.ruleId}] ${d.rule.description || d.ruleId} — ${d.agentName} (${d.agentIp})`;\n\n// ── Raw для Event: повний eventdata + syscheck ────────────────────────────────\nconst rawObj = Object.keys(sc).length > 0 ? { ...ed, syscheck: sc } : ed;\n\n// ── Індикатор ─────────────────────────────────────────────────────────────────\nconst srcIp    = (ed.ipAddress      || '').trim();\nconst destIp   = (ed.destinationIp  || '').trim();\nconst destPort = (ed.destinationPort|| '').trim();\nconst cmdLine  = (ed.commandLine    || '').trim();\nconst imgFull  = (ed.image          || '').trim();\nconst imgName  = imgFull.split('\\\\').pop() || imgFull.split('/').pop();\nconst r        = d.ruleId;\n\nlet iVal = '', iType = 'Other', iStatus = 'Under investigation', iSource = '', iFlagged = false;\n\nif ((r === '100820' || r === '100870') && srcIp && !['', '-', '::1', '127.0.0.1', d.agentIp].includes(srcIp)) {\n  iVal    = srcIp;\n  iType   = 'IP';\n  iStatus = 'Suspicious';\n  iSource = `[${r}] ${d.rule.description || r} | logon to ${d.agentName} as ${ed.targetUserName || '?'} from ${srcIp} via ${ed.authenticationPackageName || 'NTLM'}`;\n  iFlagged = true;\n\n} else if (r === '100825' || r === '100826') {\n  const ip = destIp || srcIp;\n  iVal    = destPort ? `${ip}:${destPort}` : ip;\n  iType   = 'IP';\n  iStatus = 'Suspicious';\n  iSource = `[${r}] ${d.rule.description || r} | process: ${imgName} | agent: ${d.agentName}`;\n  iFlagged = true;\n\n} else if (['100720','100721','100722','100723','100724','100725','100726','100727'].includes(r) && cmdLine) {\n  iVal    = cmdLine;\n  iType   = 'Other';\n  iStatus = 'Suspicious';\n  iSource = `[${r}] ${d.rule.description || r} | agent: ${d.agentName}`;\n  iFlagged = true;\n\n} else if (imgName) {\n  iVal    = imgFull;\n  iType   = 'Path';\n  iStatus = 'Under investigation';\n  iSource = `[${r}] ${d.rule.description || r} | agent: ${d.agentName}`;\n  iFlagged = false;\n\n} else {\n  iVal    = `[${r}] ${(d.rule.description || r)}`;\n  iType   = 'Other';\n  iStatus = 'Under investigation';\n  iSource = `agent: ${d.agentName} (${d.agentIp})`;\n  iFlagged = false;\n}\n\nconst indicatorUrl  = iVal ? `http://172.18.0.3:8080/cases/${caseId}/indicators/new` : '';\nconst indicatorForm = iVal\n  ? `Value=${enc(iVal)}&Type=${enc(iType)}&Status=${enc(iStatus)}&TLP=${enc('TLP:AMBER')}&Source=${enc(iSource)}&Flagged=${iFlagged}`\n  : '';\n\n// ── Summary (повний контекст) ─────────────────────────────────────────────────\nconst summaryParts = [\n  `[${d.ruleId}] ${d.rule.description || d.ruleId}`,\n  `Host: ${d.agentName} (${d.agentIp})`,\n  `Severity: ${sev} (level ${d.ruleLevel}/15)`,\n  mitreTac.length  ? `Tactics: ${mitreTac.join(', ')}` : '',\n  mitreIds.length  ? `MITRE: ${mitreIds.join(', ')}` : '',\n  ed.targetUserName ? `User: ${ed.targetUserName}` : '',\n  srcIp             ? `Source IP: ${srcIp}` : '',\n  `Time: ${new Date(d.timestamp).toISOString()}`,\n].filter(Boolean).join(' | ');\n\nreturn [{ json: {\n  eventUrl:      `http://172.18.0.3:8080/cases/${caseId}/events/new`,\n  noteUrl:       `http://172.18.0.3:8080/cases/${caseId}/notes/new`,\n  indicatorUrl,\n  indicatorForm,\n  caseUpdateUrl: `http://172.18.0.3:8080/cases/${caseId}`,\n\n  eventForm: [\n    `Time=${enc(new Date(d.timestamp).toISOString())}`,\n    `Type=${enc(eventType)}`,\n    `Event=${enc(eventDesc)}`,\n    `Raw=${enc(JSON.stringify(rawObj))}`,\n    `Source=Wazuh`,\n    techPart,\n  ].filter(Boolean).join('&'),\n\n  noteForm: [\n    `Title=${enc('[Wazuh] Rule ' + d.ruleId + ' — ' + new Date(d.timestamp).toISOString().slice(0, 16).replace('T', ' '))}`,\n    `Category=Wazuh`,\n    `Description=${enc(noteDesc)}`,\n  ].join('&'),\n\n  caseUpdateJson: {\n    Name:     d.existingCaseName,\n    Severity: sev,\n    Summary:  summaryParts,\n  },\n} }];\n"
+      },
+      "id": "2824fc38-fc00-4469-968a-bc03a1cdad58",
+      "name": "Build Update Payloads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1216,
+        3040
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://172.18.0.3:8080/cases/new",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ Name: '[HOST] ' + $json.agentName + ' (' + $json.agentIp + ')', Severity: $json.ruleLevel >= 12 ? 'High' : $json.ruleLevel >= 6 ? 'Medium' : 'Low', Summary: ($json.rule.description || $json.ruleId) + ' on ' + $json.agentName + ' (' + $json.agentIp + ')', Classification: 'Alert' }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "44739089-8d5b-455b-8bce-fc263bf98400",
+      "name": "Create Dagobert Case",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1216,
+        3376
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "5j6IaalQXOwNEFOO",
+          "name": "Dagobert API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ================================================================\n// NODE 6: BUILD ENRICH PAYLOADS\n// ================================================================\n//\n// Призначення:\n//   Гілка \"новий кейс\" — будує payload для первинного наповнення\n//   щойно створеного кейсу в Dagobert: Event, Asset, Indicator, Note.\n//   Також зберігає новий кейс в in-memory caseCache.\n//\n// Що робить:\n//   1. caseCache → WorkflowStaticData\n//      Після створення кейсу зберігаємо { id, name, ts } в кеш\n//      щоб наступні алерти від того ж хоста не робили зайвий\n//      GET /cases, а одразу йшли на Update.\n//   2. Event   → /cases/{id}/events/new  (form-urlencoded)\n//      Перший event для нового кейсу. Тип з MITRE tactic.\n//      Raw = повний eventdata JSON.\n//   3. Asset   → /cases/{id}/assets/new  (form-urlencoded)\n//      Хост-агент: Name=agentName, Type=Desktop, Addr=agentIp.\n//      Notes містить Agent ID + перший алерт + timestamp.\n//   4. Indicator → /cases/{id}/indicators/new (form-urlencoded)\n//      Та сама логіка що в Node 5 (Update):\n//        100820/100870 → source IP\n//        100825/100826 → destination IP:port\n//        PowerShell → commandLine\n//        image → Path\n//        fallback → опис правила\n//   5. Note    → /cases/{id}/notes/new   (form-urlencoded)\n//      Повний вміст без скорочень: rule, agent, MITRE, всі\n//      eventdata поля, повний Windows event message.\n//\n// КРИТИЧНО: Dagobert sub-entity handlers викликають Decode() двічі на одному body stream.\n// JSON режим отримує EOF при другому decode → 400. Form режим (ParseForm) кешує → обидва успішні.\n//\n// Вхід:  Create Case HTTP node → { ID, Name }\n//        Find Existing Case → { ruleId, ruleLevel, agentName, ... }\n// Вихід: { caseId, eventUrl, eventForm, assetUrl, assetForm,\n//           indicatorUrl, indicatorForm, noteUrl, noteForm }\n//\n// ================================================================\n\nconst newCase = $input.first().json;\nconst d       = $('Find Existing Case').first().json;\nconst caseId  = newCase.ID;\n\nconst store = $getWorkflowStaticData('global');\nconst caseCache = store.caseCache || {};\ncaseCache[d.corrKey] = { id: caseId, name: newCase.Name, ts: Date.now() };\nstore.caseCache = caseCache;\n\nconst ed  = d.data?.win?.eventdata || {};\nconst sys = d.data?.win?.system    || {};\nconst sc  = d.data?.syscheck || d.alert?.full_alert?.syscheck || {};\n\nconst enc = encodeURIComponent;\n\n// ── Severity ──────────────────────────────────────────────────────────────────\nconst sev = d.ruleLevel >= 12 ? 'High' : d.ruleLevel >= 6 ? 'Medium' : 'Low';\n\n// ── MITRE ─────────────────────────────────────────────────────────────────────\nconst mitre     = d.rule.mitre || {};\nconst mitreIds  = mitre.id        || [];\nconst mitreTech = mitre.technique || [];\nconst mitreTac  = mitre.tactic    || [];\n\n// Відображення Wazuh tactic (title-case) → Dagobert Event Type enum\nconst tacticToType = {\n  'Credential Access':    'Credential Access',\n  'Defense Evasion':      'Defense Evasion',\n  'Discovery':            'Discovery',\n  'Execution':            'Execution',\n  'Exfiltration':         'Exfiltration',\n  'Impact':               'Impact',\n  'Initial Access':       'Initial Access',\n  'Lateral Movement':     'Lateral Movement',\n  'Persistence':          'Persistence',\n  'Privilege Escalation': 'Privilege Escalation',\n  'Reconnaissance':       'Reconnaissance',\n  'Resource Development': 'Resource Development',\n  'Collection':           'Collection',\n  'Command and Control':  'C2',\n};\nconst eventType = mitreTac.map(t => tacticToType[t]).find(Boolean) || 'Other';\n\n// ── MITRE рядок для нотатки ───────────────────────────────────────────────────\nconst mitreStr = mitreIds.length\n  ? mitreIds.map((id, i) => `${id} — ${mitreTech[i] || ''} (${mitreTac.join(', ')})`).join('\\n  ')\n  : 'N/A';\n\n// ── Techniques для форми Event ────────────────────────────────────────────────\nconst techPart = mitreIds.length\n  ? '&' + mitreIds.map(t => `Techniques=${enc(t)}`).join('&')\n  : '';\n\n// ── Всі поля eventdata (без фільтрації, без обрізання) ────────────────────────\nconst edLines = Object.entries(ed)\n  .filter(([, v]) => v !== undefined && v !== null && v !== '')\n  .map(([k, v]) => `  ${k}: ${v}`);\n\n// ── Всі поля syscheck (без фільтрації, без обрізання) ─────────────────────────\nconst scLines = Object.entries(sc)\n  .filter(([, v]) => v !== undefined && v !== null && v !== '')\n  .map(([k, v]) => `  syscheck.${k}: ${v}`);\n\n// ── Повне Windows event message (без обрізання) ───────────────────────────────\nconst sysMsg = sys.message\n  ? `\\n\\n**Event Message (full):**\\n${sys.message}`\n  : '';\n\n// ── Опис нотатки — повний вміст, нічого не обрізається ───────────────────────\nconst noteDesc = [\n  `**Rule:** [${d.ruleId}] ${d.rule.description || d.ruleId}`,\n  `**Level:** ${d.ruleLevel}/15  |  **Severity:** ${sev}`,\n  `**Time:** ${new Date(d.timestamp).toISOString()}`,\n  `**Agent:** ${d.agentName} (${d.agentIp}) — ID: ${d.agent?.id || ''}`,\n  `**FP Status:** ${d.fpStatus}${d.fpReason ? ' — ' + d.fpReason : ''}`,\n  `**Rule Groups:** ${(d.rule.groups || []).join(', ')}`,\n  `\\n**MITRE:**\\n  ${mitreStr}`,\n  sys.eventID\n    ? `\\n**Windows Event:**\\n  EventID: ${sys.eventID}\\n  Channel: ${sys.channel || ''}\\n  Computer: ${sys.computer || ''}\\n  Provider: ${sys.providerName || ''}`\n    : '',\n  (edLines.length || scLines.length)\n    ? `\\n**Event Data:**\\n${[...edLines, ...scLines].join('\\n')}`\n    : '',\n].filter(Boolean).join('\\n') + sysMsg;\n\n// ── Опис події ────────────────────────────────────────────────────────────────\nconst eventDesc = `[${d.ruleId}] ${d.rule.description || d.ruleId} — ${d.agentName} (${d.agentIp})`;\n\n// ── Raw для Event: повний eventdata + syscheck ────────────────────────────────\nconst rawObj = Object.keys(sc).length > 0 ? { ...ed, syscheck: sc } : ed;\n\n// ── Індикатор ─────────────────────────────────────────────────────────────────\nconst srcIp    = (ed.ipAddress      || '').trim();\nconst destIp   = (ed.destinationIp  || '').trim();\nconst destPort = (ed.destinationPort|| '').trim();\nconst cmdLine  = (ed.commandLine    || '').trim();\nconst imgFull  = (ed.image          || '').trim();\nconst imgName  = imgFull.split('\\\\').pop() || imgFull.split('/').pop();\nconst r        = d.ruleId;\n\nlet iVal = '', iType = 'Other', iStatus = 'Under investigation', iSource = '', iFlagged = false;\n\nif ((r === '100820' || r === '100870') && srcIp && !['', '-', '::1', '127.0.0.1', d.agentIp].includes(srcIp)) {\n  iVal    = srcIp;\n  iType   = 'IP';\n  iStatus = 'Suspicious';\n  iSource = `[${r}] ${d.rule.description || r} | logon to ${d.agentName} as ${ed.targetUserName || '?'} from ${srcIp} via ${ed.authenticationPackageName || 'NTLM'}`;\n  iFlagged = true;\n\n} else if (r === '100825' || r === '100826') {\n  const ip = destIp || srcIp;\n  iVal    = destPort ? `${ip}:${destPort}` : ip;\n  iType   = 'IP';\n  iStatus = 'Suspicious';\n  iSource = `[${r}] ${d.rule.description || r} | process: ${imgName} | agent: ${d.agentName}`;\n  iFlagged = true;\n\n} else if (['100720','100721','100722','100723','100724','100725','100726','100727'].includes(r) && cmdLine) {\n  iVal    = cmdLine;\n  iType   = 'Other';\n  iStatus = 'Suspicious';\n  iSource = `[${r}] ${d.rule.description || r} | agent: ${d.agentName}`;\n  iFlagged = true;\n\n} else if (imgName) {\n  iVal    = imgFull;\n  iType   = 'Path';\n  iStatus = 'Under investigation';\n  iSource = `[${r}] ${d.rule.description || r} | agent: ${d.agentName}`;\n  iFlagged = false;\n\n} else {\n  iVal    = `[${r}] ${(d.rule.description || r)}`;\n  iType   = 'Other';\n  iStatus = 'Under investigation';\n  iSource = `agent: ${d.agentName} (${d.agentIp})`;\n  iFlagged = false;\n}\n\nconst indicatorForm = `Value=${enc(iVal)}&Type=${enc(iType)}&Status=${enc(iStatus)}&TLP=${enc('TLP:AMBER')}&Source=${enc(iSource)}&Flagged=${iFlagged}`;\n\n// ── Актив (Asset) ─────────────────────────────────────────────────────────────\nconst assetForm = [\n  `Name=${enc(d.agentName)}`,\n  `Type=Desktop`,\n  `Status=${enc('Under investigation')}`,\n  `Addr=${enc(d.agentIp || '')}`,\n  `Notes=${enc('Wazuh Agent ID: ' + (d.agent?.id || '') + ' | First alert: [' + d.ruleId + '] ' + (d.rule.description || '') + ' | ' + new Date(d.timestamp).toISOString())}`,\n].join('&');\n\nreturn [{ json: {\n  caseId,\n  eventUrl:     `http://172.18.0.3:8080/cases/${caseId}/events/new`,\n  assetUrl:     `http://172.18.0.3:8080/cases/${caseId}/assets/new`,\n  indicatorUrl: `http://172.18.0.3:8080/cases/${caseId}/indicators/new`,\n  noteUrl:      `http://172.18.0.3:8080/cases/${caseId}/notes/new`,\n\n  eventForm: [\n    `Time=${enc(new Date(d.timestamp).toISOString())}`,\n    `Type=${enc(eventType)}`,\n    `Event=${enc(eventDesc)}`,\n    `Raw=${enc(JSON.stringify(rawObj))}`,\n    `Source=Wazuh`,\n    techPart,\n  ].filter(Boolean).join('&'),\n\n  assetForm,\n  indicatorForm,\n\n  noteForm: [\n    `Title=${enc('[Wazuh] Rule ' + d.ruleId + ' — First Occurrence')}`,\n    `Category=Wazuh`,\n    `Description=${enc(noteDesc)}`,\n  ].join('&'),\n} }];\n"
+      },
+      "id": "de6dd152-f0b5-4db7-a074-dcd1e46d8e53",
+      "name": "Build Enrich Payloads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        3376
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.eventUrl }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/x-www-form-urlencoded"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "string",
+        "body": "={{ $json.eventForm }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "e1000001-0000-0000-0000-000000000001",
+      "name": "Push Event (Enrich)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1664,
+        3160
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "5j6IaalQXOwNEFOO",
+          "name": "Dagobert API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.assetUrl }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/x-www-form-urlencoded"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "string",
+        "body": "={{ $json.assetForm }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "e1000001-0000-0000-0000-000000000002",
+      "name": "Push Asset (Enrich)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1664,
+        3320
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "5j6IaalQXOwNEFOO",
+          "name": "Dagobert API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.indicatorUrl }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/x-www-form-urlencoded"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "string",
+        "body": "={{ $json.indicatorForm }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "e1000001-0000-0000-0000-000000000003",
+      "name": "Push Indicator (Enrich)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1664,
+        3480
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "5j6IaalQXOwNEFOO",
+          "name": "Dagobert API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.noteUrl }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/x-www-form-urlencoded"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "string",
+        "body": "={{ $json.noteForm }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "e1000001-0000-0000-0000-000000000004",
+      "name": "Push Note (Enrich)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1664,
+        3640
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "5j6IaalQXOwNEFOO",
+          "name": "Dagobert API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.eventUrl }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/x-www-form-urlencoded"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "string",
+        "body": "={{ $json.eventForm }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "e1000001-0000-0000-0000-000000000005",
+      "name": "Push Event (Update)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1440,
+        2900
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "5j6IaalQXOwNEFOO",
+          "name": "Dagobert API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.indicatorUrl }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/x-www-form-urlencoded"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "string",
+        "body": "={{ $json.indicatorForm }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "e1000001-0000-0000-0000-000000000008",
+      "name": "Push Indicator (Update)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1440,
+        2580
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "5j6IaalQXOwNEFOO",
+          "name": "Dagobert API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.noteUrl }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/x-www-form-urlencoded"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "string",
+        "body": "={{ $json.noteForm }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "e1000001-0000-0000-0000-000000000007",
+      "name": "Push Note (Update)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1440,
+        2740
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "5j6IaalQXOwNEFOO",
+          "name": "Dagobert API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.caseUpdateUrl }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.caseUpdateJson }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "e1000001-0000-0000-0000-000000000006",
+      "name": "Update Case",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1440,
+        3100
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "5j6IaalQXOwNEFOO",
+          "name": "Dagobert API Key"
+        }
+      }
     },
     {
       "parameters": {
         "respondWith": "json",
-        "responseBody": "={{ JSON.stringify($json.claudeReq) }}"
+        "responseBody": "={{ JSON.stringify({ status: 'ok' }) }}",
+        "options": {}
       },
-      "id": "node-99-respond",
+      "id": "5ffedb63-1d96-480c-9816-dfec5ee1d059",
       "name": "Respond 200",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1,
       "position": [
-        1160,
-        300
+        1920,
+        3216
       ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://dagobert:8080/api/fp-rules",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "47c31a0d-0f20-479d-810b-20651f5f3856",
+      "name": "Get FP Rules",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        112,
+        3232
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "5j6IaalQXOwNEFOO",
+          "name": "Dagobert API Key"
+        }
+      }
     }
   ],
   "connections": {
@@ -102,7 +635,7 @@
       "main": [
         [
           {
-            "node": "FP Classifier",
+            "node": "Get FP Rules",
             "type": "main",
             "index": 0
           }
@@ -124,14 +657,117 @@
       "main": [
         [
           {
-            "node": "Build Claude Prompt",
+            "node": "Get Dagobert Cases",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Build Claude Prompt": {
+    "Get Dagobert Cases": {
+      "main": [
+        [
+          {
+            "node": "Find Existing Case",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Existing Case": {
+      "main": [
+        [
+          {
+            "node": "Case Exists?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Case Exists?": {
+      "main": [
+        [
+          {
+            "node": "Build Update Payloads",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Dagobert Case",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Update Payloads": {
+      "main": [
+        [
+          {
+            "node": "Push Event (Update)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Push Indicator (Update)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Push Note (Update)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Update Case",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Dagobert Case": {
+      "main": [
+        [
+          {
+            "node": "Build Enrich Payloads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Enrich Payloads": {
+      "main": [
+        [
+          {
+            "node": "Push Event (Enrich)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Push Asset (Enrich)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Push Indicator (Enrich)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Push Note (Enrich)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Push Event (Enrich)": {
       "main": [
         [
           {
@@ -141,18 +777,98 @@
           }
         ]
       ]
+    },
+    "Push Asset (Enrich)": {
+      "main": [
+        [
+          {
+            "node": "Respond 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Push Indicator (Enrich)": {
+      "main": [
+        [
+          {
+            "node": "Respond 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Push Note (Enrich)": {
+      "main": [
+        [
+          {
+            "node": "Respond 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Push Event (Update)": {
+      "main": [
+        [
+          {
+            "node": "Respond 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Push Indicator (Update)": {
+      "main": [
+        [
+          {
+            "node": "Respond 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Push Note (Update)": {
+      "main": [
+        [
+          {
+            "node": "Respond 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Case": {
+      "main": [
+        [
+          {
+            "node": "Respond 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get FP Rules": {
+      "main": [
+        [
+          {
+            "node": "FP Classifier",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   },
-  "settings": {
-    "executionOrder": "v1"
-  },
-  "staticData": null,
+  "pinData": {},
   "meta": {
-    "templateCredsSetupCompleted": false
-  },
-  "tags": [
-    {
-      "name": "SOC"
-    }
-  ]
+    "instanceId": "cb8ea51791f380ec642339f789524813cbc6d5877921fc0b80fb81fde68e617a"
+  }
 }
